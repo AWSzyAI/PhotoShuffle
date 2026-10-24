@@ -31,6 +31,45 @@ struct ReservationOrder {
         return ReservedIndex(index: index, position: deck.cursor + 1)
     }
     mutating func putBack(_ items: [ReservedIndex]) { returned.insert(contentsOf: items, at: 0) }
+    mutating func take(avoiding blocked: Set<Int>) -> ReservedIndex? {
+        var unique = Set<Int>()
+        returned = returned.filter { unique.insert($0.index).inserted }
+        if let position = returned.firstIndex(where: { !blocked.contains($0.index) }) { return returned.remove(at: position) }
+        guard !deck.order.isEmpty, blocked.count < deck.order.count else { return nil }
+        // Do not wait for another display to finish its round (it may be waiting on us).
+        // A deferred asset gets priority as soon as free, and is stored only once even
+        // if several shuffle rounds pass while another screen holds that photograph.
+        for _ in 0..<deck.order.count {
+            guard let index = deck.next() else { break }
+            let candidate = ReservedIndex(index: index, position: deck.cursor + 1)
+            if !blocked.contains(index) { return candidate }
+            if !returned.contains(where: { $0.index == index }) { returned.append(candidate) }
+        }
+        return nil
+    }
+
+}
+struct DisplayPhotoClaims {
+    var visible: [String: Int] = [:]
+    var incoming: [String: Int] = [:]
+    func blocked(for owner: String, assetCount: Int, displayCount: Int) -> Set<Int> {
+        guard assetCount >= displayCount else { return [] }
+        return Set(visible.filter { $0.key != owner }.map { $0.value } + incoming.filter { $0.key != owner }.map { $0.value })
+    }
+    mutating func claim(_ index: Int, for owner: String, assetCount: Int, displayCount: Int) -> Bool {
+        guard !blocked(for: owner, assetCount: assetCount, displayCount: displayCount).contains(index) else { return false }
+        incoming[owner] = index; return true
+    }
+    mutating func commit(for owner: String) { if let index = incoming.removeValue(forKey: owner) { visible[owner] = index } }
+    mutating func cancel(for owner: String) { incoming.removeValue(forKey: owner) }
+    mutating func remove(_ owner: String) { visible.removeValue(forKey: owner); incoming.removeValue(forKey: owner) }
+}
+func displayIsEnabled(_ id: String, preferences: [String: Bool]) -> Bool { preferences[id] ?? true }
+func displayKey(_ screen: NSScreen) -> String {
+    let id = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0
+    if let uuid = CGDisplayCreateUUIDFromDisplayID(id)?.takeRetainedValue() { return CFUUIDCreateString(nil, uuid) as String }
+    // CG display IDs can change; the UUID above is the persistent preference key.
+    return "display-\(id)"
 }
 final class PreparedPhoto {
     let reserved: ReservedIndex
@@ -80,6 +119,58 @@ func selfTest() {
         for start in stride(from: 0, to: values.count, by: count) { precondition(Set(values[start..<start+count]).count == count) }
         if count > 1 { for i in 1..<values.count { precondition(values[i] != values[i-1]) } }
     }
+    // Paused screens and overlapping rounds never grow an unbounded deferred queue.
+    for count in [1, 2, 17] {
+        var source = ReservationOrder(); source.reset(count)
+        for _ in 0..<100 {
+            let item = source.take(avoiding: Set([0]))
+            if count == 1 { precondition(item == nil) } else { precondition(item != nil && item!.index != 0) }
+            precondition(source.returned.count <= 1)
+        }
+        // Deferred photos regain priority as soon as another screen releases them.
+        if count > 1 { precondition(source.take(avoiding: [])!.index == 0) }
+        precondition(source.take(avoiding: []) != nil)
+    }
+    var claims = DisplayPhotoClaims()
+    precondition(claims.claim(0, for: "A", assetCount: 10, displayCount: 2)); claims.commit(for: "A")
+    precondition(!claims.claim(0, for: "B", assetCount: 10, displayCount: 2))
+    precondition(claims.claim(1, for: "B", assetCount: 10, displayCount: 2))
+    precondition(!claims.claim(1, for: "A", assetCount: 10, displayCount: 2)) // pending dissolve protected
+    claims.commit(for: "B")
+    precondition(claims.claim(2, for: "A", assetCount: 10, displayCount: 2))
+    precondition(claims.blocked(for: "B", assetCount: 10, displayCount: 2) == Set([0, 2]))
+    claims.cancel(for: "A")
+    precondition(claims.blocked(for: "B", assetCount: 10, displayCount: 2) == Set([0]))
+    claims.remove("A"); precondition(claims.claim(0, for: "B", assetCount: 10, displayCount: 2))
+    precondition(claims.claim(0, for: "C", assetCount: 1, displayCount: 2)) // impossible uniqueness degrades gracefully
+    for assetCount in [2, 7, 100] {
+        var coordinator = DisplayPhotoClaims()
+        var orders = [ReservationOrder(), ReservationOrder()]
+        orders[0].reset(assetCount); orders[1].reset(assetCount)
+        for step in 0..<1000 {
+            let owner = String(step % 2)
+            let blocked = coordinator.blocked(for: owner, assetCount: assetCount, displayCount: 2)
+            if let item = orders[step % 2].take(avoiding: blocked) {
+                precondition(coordinator.claim(item.index, for: owner, assetCount: assetCount, displayCount: 2))
+                let other = String(1 - step % 2)
+                let mine = Set([coordinator.visible[owner], coordinator.incoming[owner]].compactMap { $0 })
+                let theirs = Set([coordinator.visible[other], coordinator.incoming[other]].compactMap { $0 })
+                precondition(mine.isDisjoint(with: theirs))
+                if step % 11 == 0 { coordinator.cancel(for: owner); orders[step % 2].putBack([item]) }
+                else { coordinator.commit(for: owner) }
+            }
+            precondition(orders[step % 2].returned.count <= assetCount + 1)
+        }
+        // Saving an order at stop and restoring it leaves its pending next asset intact.
+        let pending = orders[0].take()!; orders[0].putBack([pending])
+        let saved = orders[0]; var restored = saved
+        precondition(restored.take()!.index == pending.index)
+    }
+    let preferences = ["UUID-A": false, "UUID-B": true]
+    precondition(!displayIsEnabled("UUID-A", preferences: preferences))
+    precondition(displayIsEnabled("UUID-B", preferences: preferences) && displayIsEnabled("new-display", preferences: preferences))
+    // Reordering screens does not move an opt-out to a different UUID.
+    precondition(["UUID-B", "UUID-A"].filter { displayIsEnabled($0, preferences: preferences) } == ["UUID-B"])
     let u = photoURL(album: "AB CD/L0/040", asset: "EF&GH/L0/001")!
     let q = URLComponents(url: u, resolvingAgainstBaseURL: false)!.queryItems!
     precondition(q[0].value == "AB CD" && q[1].value == "EF&GH" && !u.absoluteString.contains(" "))
@@ -90,7 +181,7 @@ func selfTest() {
     precondition(!shouldStart(authorized: true, enabled: true, locked: false, asleep: false, photosActive: false, idle: 61, threshold: 60, cooldown: 0))
     // A denied status is deliberately handled by pure status logic; no Photos API is invoked here.
     precondition(![PHAuthorizationStatus.authorized, .limited].contains(.denied))
-    print("自检通过：洗牌完整覆盖/轮内不重复/跨轮不相邻重复、预留3张/消费/归还无跳漏、URL编码、自动播放条件、未授权分支。未请求或读取图库。")
+    print("自检通过：洗牌完整覆盖/轮内不重复/跨轮不相邻重复、预留3张/消费/归还无跳漏、URL编码、自动播放条件、未授权分支。多屏当前及渐变照片互斥/取消释放/图库不足降级/屏幕UUID偏好。未请求或读取图库。")
 }
 
 final class PlayerWindow: NSWindow {
@@ -116,31 +207,19 @@ final class App: NSObject, NSApplicationDelegate, PHPhotoLibraryChangeObserver {
     var autoItem: NSMenuItem!
     var fetch: PHFetchResult<PHAsset>?
     var albumID = ""
-    var reservationOrder = ReservationOrder()
-    var future: [PreparedPhoto] = []
-    var activePrepared: PreparedPhoto?
-    var pendingHistoryIndex: Int?
-    var selectedPosition = 0
-    var playbackSession = 0
+    var players: [DisplayPlayer] = []
+    var savedOrders: [String: ReservationOrder] = [:]
+    var claims = DisplayPhotoClaims()
     var idleTriggered = false
-    var history: [Int] = []
-    var historyCursor = -1
-    var currentAsset: PHAsset?
-    var player: PlayerWindow?
-    var imageView: NSImageView!
-    var transitionLayer: NSView?
-    var transitioning = false
-    var openButton: NSButton!
+    var displayStack: NSStackView!
+    var settingsStack: NSStackView!
+    var displayPreferences: [String: Bool] { defaults.dictionary(forKey: "enabledDisplays") as? [String: Bool] ?? [:] }
+    var enabledScreens: [NSScreen] { NSScreen.screens.filter { displayIsEnabled(displayKey($0), preferences: displayPreferences) } }
     var transitionPopup: NSPopUpButton!
     var dockCheckbox: NSButton!
     var dockItem: NSMenuItem!
     var transitionSeconds: Double { get { defaults.object(forKey: "transitionSeconds") == nil ? 1 : defaults.double(forKey: "transitionSeconds") } set { defaults.set(newValue, forKey: "transitionSeconds"); refreshMenu() } }
     var showDock: Bool { get { defaults.object(forKey: "showDock") == nil ? true : defaults.bool(forKey: "showDock") } set { defaults.set(newValue, forKey: "showDock"); NSApp.setActivationPolicy(newValue ? .regular : .accessory); refreshMenu() } }
-    var controls: NSStackView!
-    var caption: NSTextField!
-    var pauseButton: NSButton!
-    var paused = false
-    var loading = false
     var reading = false
     var libraryDirty = false
     var observingLibrary = false
@@ -155,13 +234,7 @@ final class App: NSObject, NSApplicationDelegate, PHPhotoLibraryChangeObserver {
     var loginItem: NSMenuItem!
     var interval: Int { get { let v = defaults.integer(forKey: "interval"); return v > 0 ? v : 10 } set { defaults.set(newValue, forKey: "interval"); refreshMenu() } }
     var stoppedAt = Date()
-    var slideTimer: Timer?
     var idleTimer: Timer?
-    var hideTimer: Timer?
-    var timeout: DispatchWorkItem?
-    var request: PHImageRequestID = PHInvalidImageRequestID
-    var generation = 0
-    let manager = PHImageManager.default()
     var authorized: Bool { [.authorized, .limited].contains(PHPhotoLibrary.authorizationStatus(for: .readWrite)) }
     var photosActive: Bool { NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.Photos" }
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -170,6 +243,7 @@ final class App: NSObject, NSApplicationDelegate, PHPhotoLibraryChangeObserver {
         NSApp.setActivationPolicy(showDock ? .regular : .accessory)
         buildMenu(); buildSettings(); buildMainMenu()
         if automatic && authorized { readLibrary() } else { showSettings() }
+        NotificationCenter.default.addObserver(self, selector: #selector(displaysChanged), name: NSApplication.didChangeScreenParametersNotification, object: nil)
         let nc = NSWorkspace.shared.notificationCenter
         nc.addObserver(self, selector: #selector(willSleep), name: NSWorkspace.willSleepNotification, object: nil)
         nc.addObserver(self, selector: #selector(didWake), name: NSWorkspace.didWakeNotification, object: nil)
@@ -248,14 +322,16 @@ final class App: NSObject, NSApplicationDelegate, PHPhotoLibraryChangeObserver {
         transitionPopup.selectItem(withTag: Int(transitionSeconds * 1000)); transitionPopup.target = self; transitionPopup.action = #selector(setPopupTransition(_:))
         let transitionRow = NSStackView(views: [NSTextField(labelWithString: "照片渐变"), transitionPopup]); transitionRow.spacing = 12
         dockCheckbox = NSButton(checkboxWithTitle: "在 Dock 中显示", target: self, action: #selector(toggleDock)); dockCheckbox.state = showDock ? .on : .off
-        let stack = NSStackView(views: [title, help, statusLabel, auth, row, transitionRow, dockCheckbox, loginCheckbox, actions]); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 12
+        displayStack = NSStackView(); displayStack.orientation = .vertical; displayStack.alignment = .leading; displayStack.spacing = 6
+        let stack = NSStackView(views: [title, help, statusLabel, auth, row, transitionRow, dockCheckbox, loginCheckbox, NSTextField(labelWithString: "选择播放屏幕（各自随机播放不同照片）"), displayStack, actions]); settingsStack = stack; stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 12
         settings.contentView!.addSubview(stack); stack.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([stack.leadingAnchor.constraint(equalTo: settings.contentView!.leadingAnchor, constant: 24), stack.trailingAnchor.constraint(equalTo: settings.contentView!.trailingAnchor, constant: -24), stack.topAnchor.constraint(equalTo: settings.contentView!.topAnchor, constant: 24), stack.bottomAnchor.constraint(lessThanOrEqualTo: settings.contentView!.bottomAnchor, constant: -24), help.widthAnchor.constraint(equalTo: stack.widthAnchor), statusLabel.widthAnchor.constraint(equalTo: stack.widthAnchor)])
         help.preferredMaxLayoutWidth = 472; statusLabel.preferredMaxLayoutWidth = 472
+        rebuildDisplayOptions()
         settings.contentView!.layoutSubtreeIfNeeded()
         settings.setContentSize(NSSize(width: 520, height: max(520, stack.fittingSize.height + 48))); settings.center()
     }
-    @objc func showSettings() { NSApp.activate(ignoringOtherApps: true); settings.makeKeyAndOrderFront(nil) }
+    @objc func showSettings() { if !players.isEmpty { stop() }; NSApp.activate(ignoringOtherApps: true); settings.makeKeyAndOrderFront(nil) }
     @objc func authorize() {
         PHPhotoLibrary.requestAuthorization(for: .readWrite) { [weak self] _ in DispatchQueue.main.async { self?.readLibrary() } }
     }
@@ -273,7 +349,7 @@ final class App: NSObject, NSApplicationDelegate, PHPhotoLibraryChangeObserver {
             DispatchQueue.main.async {
                 self.reading = false
                 guard self.authorized else { self.fetch = nil; self.statusLabel.stringValue = "照片访问权限已关闭。"; return }
-                self.fetch = result; self.albumID = id; self.reservationOrder.reset(result.count); self.history = []; self.historyCursor = -1
+                self.fetch = result; self.albumID = id; self.claims = DisplayPhotoClaims(); self.savedOrders = [:]
                 self.statusLabel.stringValue = "图库可访问照片：\(result.count) 张。自动播放\(self.automatic ? "已开启" : "已关闭")。"
             }
         }
@@ -283,7 +359,7 @@ final class App: NSObject, NSApplicationDelegate, PHPhotoLibraryChangeObserver {
             guard let current = self.fetch, changeInstance.changeDetails(for: current) != nil else { return }
             self.libraryDirty = true
             // Preserve the currently displayed image; refresh metadata after playback ends.
-            if self.player == nil && !self.reading && self.authorized { self.readLibrary() }
+            if self.players.isEmpty && !self.reading && self.authorized { self.readLibrary() }
         }
     }
     @objc func toggleLogin() {
@@ -296,7 +372,7 @@ final class App: NSObject, NSApplicationDelegate, PHPhotoLibraryChangeObserver {
     @objc func toggleAuto() { automatic.toggle(); stoppedAt = Date() }
     @objc func setIdle(_ sender: NSMenuItem) { idleSeconds = sender.tag; stoppedAt = Date() }
     @objc func setPopupIdle(_ sender: NSPopUpButton) { idleSeconds = sender.selectedTag(); stoppedAt = Date() }
-    @objc func setInterval(_ sender: NSMenuItem) { interval = sender.tag; scheduleSlide() }
+    @objc func setInterval(_ sender: NSMenuItem) { interval = sender.tag; players.forEach { $0.scheduleSlide() } }
     @objc func quit() { stop(); NSApp.terminate(nil) }
     @objc func willSleep() { asleep = true; stop() }
     @objc func didWake() { asleep = false; stoppedAt = Date() }
@@ -305,22 +381,100 @@ final class App: NSObject, NSApplicationDelegate, PHPhotoLibraryChangeObserver {
     @objc func didLock() { locked = true; stop() }
     @objc func didUnlock() { locked = false; stoppedAt = Date() }
     @objc func activated(_ n: Notification) { if photosActive { stop() } }
+    @objc func displaysChanged() {
+        stop(); rebuildDisplayOptions()
+        statusLabel.stringValue = "显示器配置已变化，已安全结束播放。下次播放按新的屏幕选择启动。"
+    }
+    func rebuildDisplayOptions() {
+        displayStack.arrangedSubviews.forEach { displayStack.removeArrangedSubview($0); $0.removeFromSuperview() }
+        for (index, screen) in NSScreen.screens.enumerated() {
+            let button = NSButton(checkboxWithTitle: "屏幕 \(index + 1)：\(screen.localizedName)（\(Int(screen.frame.width)) × \(Int(screen.frame.height))）", target: self, action: #selector(toggleDisplay(_:)))
+            button.identifier = NSUserInterfaceItemIdentifier(displayKey(screen))
+            button.state = displayIsEnabled(displayKey(screen), preferences: displayPreferences) ? .on : .off
+            displayStack.addArrangedSubview(button)
+        }
+        settings.contentView!.layoutSubtreeIfNeeded()
+        settings.setContentSize(NSSize(width: 520, height: max(520, settingsStack.fittingSize.height + 48)))
+    }
+    @objc func toggleDisplay(_ sender: NSButton) {
+        guard let id = sender.identifier?.rawValue else { return }
+        var preferences = displayPreferences; preferences[id] = sender.state == .on
+        defaults.set(preferences, forKey: "enabledDisplays"); stop()
+        statusLabel.stringValue = enabledScreens.isEmpty ? "尚未选择播放屏幕。勾选至少一块屏幕后再播放。" : "播放屏幕已更新，下次播放生效。"
+    }
+    var canRevealPlayer: Bool {
+        let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: CGEventType(rawValue: UInt32.max)!)
+        return authorized && !locked && !asleep && !screensaverActive && !photosActive && (!idleTriggered || (automatic && idle >= Double(idleSeconds)))
+    }
     func checkIdle() {
         let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: CGEventType(rawValue: UInt32.max)!)
-        if player != nil && (!authorized || photosActive || (player?.isVisible == false && idleTriggered && idle < Double(idleSeconds))) { stop(); statusLabel.stringValue = "照片准备已取消，等待下一次空闲。" }
-        guard player == nil, fetch != nil, !reading, !screensaverActive else { return }
+        if !players.isEmpty && (!authorized || photosActive || (players.allSatisfy { $0.player?.isVisible == false } && idleTriggered && idle < Double(idleSeconds))) { stop(); statusLabel.stringValue = "照片准备已取消，等待下一次空闲。" }
+        guard players.isEmpty, fetch != nil, !reading, !screensaverActive, !enabledScreens.isEmpty else { return }
         if libraryDirty && authorized { readLibrary(); return }
         if shouldStart(authorized: authorized, enabled: automatic, locked: locked, asleep: asleep, photosActive: photosActive, idle: idle, threshold: Double(idleSeconds), cooldown: Date().timeIntervalSince(stoppedAt)) { beginPlayback(automatically: true) }
     }
     @objc func play() { beginPlayback(automatically: false) }
     func beginPlayback(automatically: Bool) {
         guard authorized else { statusLabel.stringValue = "请先授权并读取图库。"; showSettings(); return }
-        guard !locked, !asleep, !photosActive, !screensaverActive else { return }
+        guard !locked, !asleep, !photosActive, !screensaverActive, players.isEmpty else { return }
         guard let result = fetch, result.count > 0 else { statusLabel.stringValue = reading ? "正在读取图库，请稍候。" : "请先点击“授权并读取图库”，确认图库中有可访问照片。"; showSettings(); return }
-        if player != nil { return }
         if libraryDirty { readLibrary(); return }
-        guard let screen = NSScreen.main else { return }
-        idleTriggered = automatically
+        let screens = enabledScreens
+        guard !screens.isEmpty else { statusLabel.stringValue = "尚未选择播放屏幕。请至少勾选一块屏幕。"; showSettings(); return }
+        idleTriggered = automatically; claims = DisplayPhotoClaims()
+        players = screens.map { DisplayPlayer(app: self, screen: $0, count: result.count) }
+        settings.orderOut(nil)
+        players.forEach { $0.start() }
+    }
+    @objc func stop() {
+        let stopped = players; players = []; stopped.forEach { $0.stop() }
+        claims = DisplayPhotoClaims(); stoppedAt = Date()
+        if libraryDirty && authorized && !reading { DispatchQueue.main.async { [weak self] in guard let self = self, self.players.isEmpty, self.libraryDirty, !self.reading else { return }; self.readLibrary() } }
+    }
+}
+
+final class DisplayPlayer: NSObject {
+    unowned let app: App
+    let screen: NSScreen
+    let id: String
+    var reservationOrder = ReservationOrder()
+    var future: [PreparedPhoto] = []
+    var activePrepared: PreparedPhoto?
+    var pendingHistoryIndex: Int?
+    var selectedPosition = 0
+    var playbackSession = 0
+    var history: [Int] = []
+    var historyCursor = -1
+    var currentAsset: PHAsset?
+    var player: PlayerWindow?
+    var imageView: NSImageView!
+    var transitionLayer: NSView?
+    var transitioning = false
+    var openButton: NSButton!
+    var controls: NSStackView!
+    var caption: NSTextField!
+    var pauseButton: NSButton!
+    var paused = false
+    var loading = false
+    var slideTimer: Timer?
+    var hideTimer: Timer?
+    var timeout: DispatchWorkItem?
+    var request: PHImageRequestID = PHInvalidImageRequestID
+    var generation = 0
+    let manager = PHImageManager.default()
+    var fetch: PHFetchResult<PHAsset>? { app.fetch }
+    var authorized: Bool { app.authorized }
+    var transitionSeconds: Double { app.transitionSeconds }
+    var interval: Int { app.interval }
+    var statusLabel: NSTextField { app.statusLabel }
+    var albumID: String { app.albumID }
+    init(app: App, screen: NSScreen, count: Int) {
+        self.app = app; self.screen = screen; self.id = displayKey(screen); super.init()
+        if let saved = app.savedOrders[id] { reservationOrder = saved } else { reservationOrder.reset(count) }
+    }
+    func showSettings() { app.showSettings() }
+    @objc func endPlayback() { app.stop() }
+    func start() {
         let w = PlayerWindow(contentRect: screen.frame, styleMask: [.borderless], backing: .buffered, defer: false)
         w.appearance = NSAppearance(named: .darkAqua)
         w.level = .normal; w.backgroundColor = .black; w.isReleasedWhenClosed = false; w.acceptsMouseMovedEvents = true
@@ -330,16 +484,19 @@ final class App: NSObject, NSApplicationDelegate, PHPhotoLibraryChangeObserver {
         caption = NSTextField(labelWithString: "正在加载…"); caption.textColor = .white; caption.font = .systemFont(ofSize: 14, weight: .medium)
         pauseButton = NSButton(title: "暂停", target: self, action: #selector(togglePause))
         openButton = NSButton(title: "在照片中打开", target: self, action: #selector(openPhoto))
-        controls = NSStackView(views: [caption, NSButton(title: "上一张", target: self, action: #selector(previous)), pauseButton, NSButton(title: "下一张", target: self, action: #selector(nextPhoto)), openButton, NSButton(title: "结束", target: self, action: #selector(stop))])
+        controls = NSStackView(views: [caption, NSButton(title: "上一张", target: self, action: #selector(previous)), pauseButton, NSButton(title: "下一张", target: self, action: #selector(nextPhoto)), openButton, NSButton(title: "结束", target: self, action: #selector(endPlayback))])
         controls.orientation = .horizontal; controls.spacing = 12
         controls.edgeInsets = NSEdgeInsets(top: 12, left: 16, bottom: 12, right: 16)
         for case let button as NSButton in controls.arrangedSubviews { button.font = .systemFont(ofSize: 14, weight: .medium); button.bezelStyle = .rounded; button.contentTintColor = .white }
          controls.wantsLayer = true; controls.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.85).cgColor; controls.layer?.cornerRadius = 12
         root.addSubview(controls); controls.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([controls.centerXAnchor.constraint(equalTo: root.centerXAnchor), controls.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -24), controls.widthAnchor.constraint(lessThanOrEqualTo: root.widthAnchor, constant: -32)])
-        root.moved = { [weak self] in self?.showControls() }
+        root.moved = { [weak self] in
+            guard let self = self, self.player?.isVisible == true else { return }
+            self.player?.makeKey(); self.showControls()
+        }
         w.contentView = root; w.keyHandler = { [weak self] key in
-            switch key { case 53: self?.stop(); case 49: self?.togglePause(); case 123: self?.previous(); case 124: self?.nextPhoto(); case 31,36,76: self?.openPhoto(); default: break }
+            switch key { case 53: self?.endPlayback(); case 49: self?.togglePause(); case 123: self?.previous(); case 124: self?.nextPhoto(); case 31,36,76: self?.openPhoto(); default: break }
         }
         player = w; paused = false; statusLabel.stringValue = "正在准备照片（已就绪 0 / 3），准备好后开始展示。可随时点结束或退出。"; showControls(); advance(failures: 0)
     }
@@ -348,6 +505,7 @@ final class App: NSObject, NSApplicationDelegate, PHPhotoLibraryChangeObserver {
         hideTimer = Timer.scheduledTimer(withTimeInterval: 4, repeats: false) { [weak self] _ in if self?.loading == false { self?.controls?.isHidden = true } }
     }
     func cancelRequest(returnPrepared: Bool = true) {
+        app.claims.cancel(for: id)
         generation += 1; timeout?.cancel(); timeout = nil
         if let active = activePrepared {
             if returnPrepared {
@@ -363,13 +521,13 @@ final class App: NSObject, NSApplicationDelegate, PHPhotoLibraryChangeObserver {
         if request != PHInvalidImageRequestID { manager.cancelImageRequest(request); request = PHInvalidImageRequestID }
         slideTimer?.invalidate(); slideTimer = nil; loading = false
     }
-    @objc func stop() {
+    func stop() {
         let unshown = (activePrepared.map { [$0.reserved] } ?? []) + future.map { $0.reserved }
-        reservationOrder.putBack(unshown)
+        reservationOrder.putBack(unshown); app.savedOrders[id] = reservationOrder
         playbackSession += 1
         future.forEach(cancelPrepared); future = []
-        cancelRequest(returnPrepared: false); hideTimer?.invalidate(); player?.orderOut(nil); player = nil; currentAsset = nil; imageView?.image = nil; stoppedAt = Date()
-        if libraryDirty && authorized && !reading { DispatchQueue.main.async { [weak self] in guard let self = self, self.player == nil, self.libraryDirty, !self.reading else { return }; self.readLibrary() } }
+        cancelRequest(returnPrepared: false); hideTimer?.invalidate(); player?.orderOut(nil); player = nil; currentAsset = nil; imageView?.image = nil
+        app.claims.remove(id)
     }
     @objc func togglePause() { paused.toggle(); pauseButton?.title = paused ? "继续" : "暂停"; if paused { slideTimer?.invalidate() } else { scheduleSlide() }; showControls() }
     @objc func previous() {
@@ -377,18 +535,30 @@ final class App: NSObject, NSApplicationDelegate, PHPhotoLibraryChangeObserver {
     }
     @objc func nextPhoto() { advance(failures: 0) }
     func advance(failures: Int) {
-        guard player != nil, authorized else { stop(); return }
+        guard player != nil, authorized else { app.stop(); return }
         if historyCursor + 1 < history.count { historyCursor += 1; load(history[historyCursor], failures: failures); return }
         cancelRequest()
+        let blocked = app.claims.blocked(for: id, assetCount: fetch?.count ?? 0, displayCount: app.players.count)
+        let unavailable = future.filter { blocked.contains($0.reserved.index) }
+        future.removeAll { blocked.contains($0.reserved.index) }
+        reservationOrder.putBack(unavailable.map { $0.reserved }); unavailable.forEach(cancelPrepared)
         fillPrefetch()
-        guard !future.isEmpty else { return }
+        guard !future.isEmpty else {
+            caption.stringValue = "等待另一块屏幕切换…"; showControls()
+            let token = generation
+            slideTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: false) { [weak self] _ in
+                guard let self = self, self.generation == token, self.player != nil else { return }
+                self.advance(failures: failures)
+            }
+            return
+        }
         let prepared = future.removeFirst(); activePrepared = prepared; selectedPosition = prepared.reserved.position
         pendingHistoryIndex = prepared.reserved.index; loading = true
         caption.stringValue = "下一张准备中 · 已预备 \(future.filter { $0.image != nil }.count) / 3"; showControls()
         deliverPrepared(prepared, failures: failures)
     }
     func targetSize() -> NSSize {
-        let screen = player?.screen ?? NSScreen.main
+        let screen: NSScreen? = self.screen
         let width = (screen?.frame.width ?? 1920) * (screen?.backingScaleFactor ?? 1)
         let height = (screen?.frame.height ?? 1080) * (screen?.backingScaleFactor ?? 1)
         let scale = min(1, 2560 / max(width, height))
@@ -399,10 +569,15 @@ final class App: NSObject, NSApplicationDelegate, PHPhotoLibraryChangeObserver {
         if prepared.request != PHInvalidImageRequestID { manager.cancelImageRequest(prepared.request); prepared.request = PHInvalidImageRequestID }
         prepared.image = nil
     }
+    func nextReservation() -> ReservedIndex? {
+        guard let result = fetch else { return nil }
+        let blocked = app.claims.blocked(for: id, assetCount: result.count, displayCount: app.players.count)
+        return reservationOrder.take(avoiding: blocked)
+    }
     func fillPrefetch() {
         guard player != nil, let result = fetch else { return }
         while future.count + (activePrepared == nil ? 0 : 1) < 3 {
-            guard let reserved = reservationOrder.take() else { break }
+            guard let reserved = nextReservation() else { break }
             let prepared = PreparedPhoto(reserved); future.append(prepared)
             let session = playbackSession
             let options = PHImageRequestOptions(); options.isNetworkAccessAllowed = true; options.deliveryMode = .highQualityFormat; options.resizeMode = .exact
@@ -468,19 +643,37 @@ final class App: NSObject, NSApplicationDelegate, PHPhotoLibraryChangeObserver {
         }
     }
     func present(_ image: NSImage, asset: PHAsset, token: Int, total: Int) {
+        guard let index = fetch?.index(of: asset), index != NSNotFound else { return }
+        guard app.claims.claim(index, for: id, assetCount: total, displayCount: app.players.count) else {
+            // Another display changed while this photo loaded. Keep the old frame and wait;
+            // no conflicting photo is made visible, including during dissolve or history.
+            caption.stringValue = "等待另一块屏幕切换…"; showControls()
+            slideTimer?.invalidate()
+            slideTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: false) { [weak self] _ in
+                guard let self = self, self.generation == token, self.player != nil else { return }
+                if self.activePrepared != nil { self.advance(failures: self.preparedFailures) }
+                else { self.present(image, asset: asset, token: token, total: total) }
+            }
+            return
+        }
         let finish: () -> Void = { [weak self] in
             guard let self = self, self.generation == token, self.player != nil else { return }
             if self.player?.isVisible == false {
-                let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: CGEventType(rawValue: UInt32.max)!)
-                guard self.authorized, !self.locked, !self.asleep, !self.screensaverActive, !self.photosActive, !self.idleTriggered || (self.automatic && idle >= Double(self.idleSeconds)) else { self.stop(); self.statusLabel.stringValue = "照片准备已取消。"; return }
+                guard self.app.canRevealPlayer else { self.app.stop(); self.statusLabel.stringValue = "照片准备已取消。"; return }
             }
+            self.app.claims.commit(for: self.id)
             self.imageView.image = image; self.currentAsset = asset
             if let index = self.pendingHistoryIndex {
                 self.history.append(index); self.historyCursor = self.history.count - 1
                 if self.history.count > 200 { self.history.removeFirst(); self.historyCursor -= 1 }
             }
             self.pendingHistoryIndex = nil; self.activePrepared = nil
-            if self.player?.isVisible == false { NSApp.activate(ignoringOtherApps: true); self.player?.makeKeyAndOrderFront(nil); self.statusLabel.stringValue = "照片展示已开始；已开启 3 张提前准备。" }
+            if self.player?.isVisible == false {
+                let anotherVisible = self.app.players.contains { $0 !== self && $0.player?.isVisible == true }
+                NSApp.activate(ignoringOtherApps: true)
+                if anotherVisible { self.player?.orderFront(nil) } else { self.player?.makeKeyAndOrderFront(nil) }
+                self.statusLabel.stringValue = "已在 \(self.app.players.count) 块屏幕分别随机播放；每屏提前准备 3 张。"
+            }
             self.fillPrefetch()
             self.transitionLayer?.removeFromSuperview(); self.transitionLayer = nil; self.transitioning = false; self.openButton.isEnabled = true
             let date = asset.creationDate.map { DateFormatter.localizedString(from: $0, dateStyle: .medium, timeStyle: .none) } ?? "日期未知"
@@ -501,7 +694,7 @@ final class App: NSObject, NSApplicationDelegate, PHPhotoLibraryChangeObserver {
         guard generation == token, player != nil else { return }
         if player?.isVisible == false {
             cancelRequest(returnPrepared: false) // Explicitly skip a failed first reservation.
-            stop(); statusLabel.stringValue = "首张照片未能准备好：\(reason)。请检查网络或重新播放。"; showSettings(); return
+            app.stop(); statusLabel.stringValue = "首张照片未能准备好：\(reason)。请检查网络或重新播放。"; showSettings(); return
         }
         // Failed reservations are explicitly skipped; ordinary cancellation always returns them.
         cancelRequest(returnPrepared: false)
@@ -521,7 +714,7 @@ final class App: NSObject, NSApplicationDelegate, PHPhotoLibraryChangeObserver {
     @objc func openPhoto() {
         guard !transitioning, let asset = currentAsset else { return }
         guard !albumID.isEmpty, let url = photoURL(album: albumID, asset: asset.localIdentifier) else { caption.stringValue = "未找到系统图库标识，无法定位。"; showControls(); return }
-        stop()
+        app.stop()
         if !NSWorkspace.shared.open(url) { statusLabel.stringValue = "系统未能打开照片链接。请手动在“照片”中查找。"; showSettings() }
     }
 }
