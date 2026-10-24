@@ -87,6 +87,15 @@ func photoURL(album: String, asset: String) -> URL? {
 func shouldStart(authorized: Bool, enabled: Bool, locked: Bool, asleep: Bool, photosActive: Bool, idle: Double, threshold: Double, cooldown: Double) -> Bool {
     authorized && enabled && !locked && !asleep && !photosActive && idle >= threshold && cooldown >= threshold
 }
+enum ActivationPresentation { case photos, settings }
+func activationPresentation(readyPhotos: Int) -> ActivationPresentation { readyPhotos > 0 ? .photos : .settings }
+func playbackBlockReason(locked: Bool, asleep: Bool, screensaverActive: Bool, photosActive: Bool, automatically: Bool) -> String? {
+    if locked { return "Mac 正在锁定，请解锁后再播放。" }
+    if asleep { return "显示器正在休眠，请唤醒后再播放。" }
+    if screensaverActive { return "系统屏保正在运行，请退出系统屏保后再播放。" }
+    if automatically && photosActive { return "正在使用照片 App，暂不自动播放。" }
+    return nil
+}
 func selfTest() {
     for n in [0, 1, 2, 17, 500] {
         var d = ShuffleDeck(); d.reset(n)
@@ -179,9 +188,20 @@ func selfTest() {
         precondition(!shouldStart(authorized: flag != 0, enabled: flag != 1, locked: flag == 2, asleep: flag == 3, photosActive: flag == 4, idle: 61, threshold: 60, cooldown: 61))
     }
     precondition(!shouldStart(authorized: true, enabled: true, locked: false, asleep: false, photosActive: false, idle: 61, threshold: 60, cooldown: 0))
+    // Activation restores ready photographs, but never exposes blank loading windows.
+    precondition(activationPresentation(readyPhotos: 0) == .settings)
+    precondition(activationPresentation(readyPhotos: 1) == .photos)
+    precondition(activationPresentation(readyPhotos: 2) == .photos)
+    precondition(playbackBlockReason(locked: false, asleep: false, screensaverActive: false, photosActive: true, automatically: false) == nil)
+    precondition(playbackBlockReason(locked: false, asleep: false, screensaverActive: false, photosActive: true, automatically: true) != nil)
+    for automatically in [false, true] {
+        for flag in 0..<3 {
+            precondition(playbackBlockReason(locked: flag == 0, asleep: flag == 1, screensaverActive: flag == 2, photosActive: false, automatically: automatically) != nil)
+        }
+    }
     // A denied status is deliberately handled by pure status logic; no Photos API is invoked here.
     precondition(![PHAuthorizationStatus.authorized, .limited].contains(.denied))
-    print("自检通过：洗牌完整覆盖/轮内不重复/跨轮不相邻重复、预留3张/消费/归还无跳漏、URL编码、自动播放条件、未授权分支。多屏当前及渐变照片互斥/取消释放/图库不足降级/屏幕UUID偏好。未请求或读取图库。")
+    print("自检通过：洗牌完整覆盖/轮内不重复/跨轮不相邻重复、预留3张/消费/归还无跳漏、URL编码、自动播放条件、未授权分支。多屏当前及渐变照片互斥/取消释放/图库不足降级/屏幕UUID偏好、激活仅展示已就绪照片、手动与自动播放安全条件。未请求或读取图库。")
 }
 
 final class PlayerWindow: NSWindow {
@@ -258,7 +278,29 @@ final class App: NSObject, NSApplicationDelegate, PHPhotoLibraryChangeObserver {
         idleTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.checkIdle() }
         // Launch never requests authorization or enumerates the library.
     }
-    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { showSettings(); return true }
+    func applicationDidBecomeActive(_ notification: Notification) {
+        // Activation also occurs when our first prepared photograph is revealed. Do not
+        // use showSettings(): it intentionally stops playback for an explicit menu action.
+        restoreWindows()
+    }
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { restoreWindows(); return true }
+    func restoreWindows() {
+        guard settings != nil, !locked, !asleep, !screensaverActive else { return }
+        let ready = players.filter { authorized && $0.currentAsset != nil && $0.imageView?.image != nil && $0.player != nil }
+        switch activationPresentation(readyPhotos: ready.count) {
+        case .photos:
+            settings.orderOut(nil)
+            for photo in ready {
+                if photo.player?.isMiniaturized == true { photo.player?.deminiaturize(nil) }
+                photo.player?.orderFront(nil)
+            }
+            let target = ready.first { $0.screen.frame.contains(NSEvent.mouseLocation) } ?? ready.first
+            target?.player?.makeKeyAndOrderFront(nil)
+        case .settings:
+            if settings.isMiniaturized { settings.deminiaturize(nil) }
+            settings.makeKeyAndOrderFront(nil)
+        }
+    }
     @objc func toggleDock() { showDock.toggle() }
     @objc func setTransition(_ sender: NSMenuItem) { transitionSeconds = Double(sender.tag) / 1000 }
     @objc func setPopupTransition(_ sender: NSPopUpButton) { transitionSeconds = Double(sender.selectedTag()) / 1000 }
@@ -301,6 +343,7 @@ final class App: NSObject, NSApplicationDelegate, PHPhotoLibraryChangeObserver {
     }
     func buildSettings() {
         settings = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 580), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        settings.collectionBehavior = [.moveToActiveSpace]
         settings.title = "照片随放"; settings.isReleasedWhenClosed = false; settings.center()
         let title = NSTextField(labelWithString: "让整个图库，一张张随机遇见。")
         title.font = .systemFont(ofSize: 21, weight: .semibold)
@@ -404,11 +447,11 @@ final class App: NSObject, NSApplicationDelegate, PHPhotoLibraryChangeObserver {
     }
     var canRevealPlayer: Bool {
         let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: CGEventType(rawValue: UInt32.max)!)
-        return authorized && !locked && !asleep && !screensaverActive && !photosActive && (!idleTriggered || (automatic && idle >= Double(idleSeconds)))
+        return authorized && !locked && !asleep && !screensaverActive && (!idleTriggered || !photosActive) && (!idleTriggered || (automatic && idle >= Double(idleSeconds)))
     }
     func checkIdle() {
         let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: CGEventType(rawValue: UInt32.max)!)
-        if !players.isEmpty && (!authorized || photosActive || (players.allSatisfy { $0.player?.isVisible == false } && idleTriggered && idle < Double(idleSeconds))) { stop(); statusLabel.stringValue = "照片准备已取消，等待下一次空闲。" }
+        if !players.isEmpty && (!authorized || (idleTriggered && photosActive) || (players.allSatisfy { $0.player?.isVisible == false } && idleTriggered && idle < Double(idleSeconds))) { stop(); statusLabel.stringValue = "照片准备已取消，等待下一次空闲。" }
         guard players.isEmpty, fetch != nil, !reading, !screensaverActive, !enabledScreens.isEmpty else { return }
         if libraryDirty && authorized { readLibrary(); return }
         if shouldStart(authorized: authorized, enabled: automatic, locked: locked, asleep: asleep, photosActive: photosActive, idle: idle, threshold: Double(idleSeconds), cooldown: Date().timeIntervalSince(stoppedAt)) { beginPlayback(automatically: true) }
@@ -416,14 +459,26 @@ final class App: NSObject, NSApplicationDelegate, PHPhotoLibraryChangeObserver {
     @objc func play() { beginPlayback(automatically: false) }
     func beginPlayback(automatically: Bool) {
         guard authorized else { statusLabel.stringValue = "请先授权并读取图库。"; showSettings(); return }
-        guard !locked, !asleep, !photosActive, !screensaverActive, players.isEmpty else { return }
+        if let reason = playbackBlockReason(locked: locked, asleep: asleep, screensaverActive: screensaverActive, photosActive: photosActive, automatically: automatically) {
+            if !automatically { statusLabel.stringValue = reason; restoreWindows() }
+            return
+        }
+        if !players.isEmpty {
+            if !automatically {
+                if players.allSatisfy({ $0.currentAsset == nil }) { statusLabel.stringValue = "正在准备首张照片，准备好后会自动展示，请稍候。" }
+                NSApp.activate(ignoringOtherApps: true); restoreWindows()
+            }
+            return
+        }
         guard let result = fetch, result.count > 0 else { statusLabel.stringValue = reading ? "正在读取图库，请稍候。" : "请先点击“授权并读取图库”，确认图库中有可访问照片。"; showSettings(); return }
-        if libraryDirty { readLibrary(); return }
+        if libraryDirty { readLibrary(); statusLabel.stringValue = "图库有更新，正在重新读取。完成后请再点立即播放。"; if !automatically { restoreWindows() }; return }
         let screens = enabledScreens
         guard !screens.isEmpty else { statusLabel.stringValue = "尚未选择播放屏幕。请至少勾选一块屏幕。"; showSettings(); return }
         idleTriggered = automatically; claims = DisplayPhotoClaims()
         players = screens.map { DisplayPlayer(app: self, screen: $0, count: result.count) }
-        settings.orderOut(nil)
+        // Keep progress visible while the first photographs load. Only ready image
+        // windows are shown; activation/reopen during preparation must not cancel it.
+        if !automatically { NSApp.activate(ignoringOtherApps: true); restoreWindows() }
         players.forEach { $0.start() }
     }
     @objc func stop() {
@@ -478,7 +533,7 @@ final class DisplayPlayer: NSObject {
         let w = PlayerWindow(contentRect: screen.frame, styleMask: [.borderless], backing: .buffered, defer: false)
         w.appearance = NSAppearance(named: .darkAqua)
         w.level = .normal; w.backgroundColor = .black; w.isReleasedWhenClosed = false; w.acceptsMouseMovedEvents = true
-        w.collectionBehavior = [.fullScreenAuxiliary]
+        w.collectionBehavior = [.fullScreenAuxiliary, .moveToActiveSpace]
         let root = MovingView(frame: NSRect(origin: .zero, size: screen.frame.size)); root.wantsLayer = true; root.layer?.backgroundColor = NSColor.black.cgColor
         imageView = NSImageView(frame: root.bounds); imageView.autoresizingMask = [.width, .height]; imageView.imageScaling = .scaleProportionallyUpOrDown; root.addSubview(imageView)
         caption = NSTextField(labelWithString: "正在加载…"); caption.textColor = .white; caption.font = .systemFont(ofSize: 14, weight: .medium)
@@ -670,6 +725,7 @@ final class DisplayPlayer: NSObject {
             self.pendingHistoryIndex = nil; self.activePrepared = nil
             if self.player?.isVisible == false {
                 let anotherVisible = self.app.players.contains { $0 !== self && $0.player?.isVisible == true }
+                self.app.settings.orderOut(nil)
                 NSApp.activate(ignoringOtherApps: true)
                 if anotherVisible { self.player?.orderFront(nil) } else { self.player?.makeKeyAndOrderFront(nil) }
                 self.statusLabel.stringValue = "已在 \(self.app.players.count) 块屏幕分别随机播放；每屏提前准备 3 张。"
